@@ -4,16 +4,28 @@
 Provenance Guard — Flask Backend
 
 AI 201 — Project 4
-Milestone 4: Multiple Signals and Confidence Scoring
+Milestone 5: Labels, Appeals, and Verified-Human Demo
 
 Routes:
-    POST /ping       Working example
-    POST /submit     Submit text for three-signal analysis
-    POST /appeal     Milestone 5
-    GET  /log        Read audit log
-    GET  /health     Service health information
+    POST /ping
+    GET  /health
+    POST /submit
+    POST /appeal
+    GET  /content/<content_id>
+    POST /verify/start
+    POST /verify/complete
+    GET  /log
+
+Signals:
+    Model:      50%
+    Stylometry: 30%
+    Repetition: 20%
+
+This is an educational detector, not proof of authorship.
 """
 
+import secrets
+import time
 import uuid
 
 from flask import Flask, jsonify, request
@@ -23,11 +35,14 @@ import config
 import detector
 import scoring
 import stylometry
-
 from repetition import repetition_signal
 
 
 app = Flask(__name__)
+
+# In-memory challenges expire after five minutes.
+# Successful verification events are saved in the audit log.
+verification_challenges = {}
 
 
 # ============================================================
@@ -35,12 +50,7 @@ app = Flask(__name__)
 # ============================================================
 
 class _LimiterOff:
-    """
-    Placeholder for rate limiting until Unit 8.
-
-    Allows the limiter decorator to remain available
-    without enforcing limits.
-    """
+    """No-op limiter until Unit 8."""
 
     def limit(self, *args, **kwargs):
         return lambda view: view
@@ -53,8 +63,6 @@ if config.RATE_LIMITING_ENABLED:
     from flask_limiter.util import get_remote_address
 
     def rate_limit_key():
-        """Identify the creator making a request."""
-
         payload = request.get_json(silent=True)
 
         if not isinstance(payload, dict):
@@ -76,8 +84,6 @@ if config.RATE_LIMITING_ENABLED:
 
     @app.errorhandler(429)
     def rate_limited(exc):
-        """Record rate-limit rejections."""
-
         payload = request.get_json(silent=True)
 
         if not isinstance(payload, dict):
@@ -97,17 +103,94 @@ if config.RATE_LIMITING_ENABLED:
 
 
 # ============================================================
+# Helpers
+# ============================================================
+
+def error_response(message, status=400):
+    return jsonify({"error": message}), status
+
+
+def valid_string(value, maximum=5000):
+    """Check that a value is a nonempty bounded string."""
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and len(value) <= maximum
+    )
+
+
+def all_audit_entries():
+    """Read the append-only audit trail."""
+    return audit.read_entries()
+
+
+def creator_is_verified(creator_id):
+    """
+    Look for a previously completed demo challenge.
+
+    This checks recorded verification events,
+    including events written before server restart.
+    """
+    return any(
+        entry.get("event") == "human_verified"
+        and entry.get("creator_id") == creator_id
+        for entry in all_audit_entries()
+    )
+
+
+def content_state(content_id):
+    """
+    Reconstruct a submission's current status.
+
+    Original decisions are preserved. Appeals append
+    new events rather than replacing the decision.
+    """
+    entries = [
+        entry for entry in all_audit_entries()
+        if entry.get("content_id") == content_id
+    ]
+
+    decision = next(
+        (
+            entry for entry in entries
+            if entry.get("status") == "decided"
+            and entry.get("combined_score") is not None
+        ),
+        None,
+    )
+
+    if decision is None:
+        return None
+
+    appeals = [
+        entry for entry in entries
+        if entry.get("event") == "appeal"
+    ]
+
+    return {
+        "content_id": content_id,
+        "creator_id": decision["creator_id"],
+        "guess": decision["guess"],
+        "confidence": decision["combined_score"],
+        "label": decision["label"],
+        "model_score": decision["model_score"],
+        "style_score": decision.get("style_score"),
+        "repetition_score": decision.get("repetition_score"),
+        "status": "under_review" if appeals else "decided",
+        "appeal_count": len(appeals),
+        "verified_human": decision.get(
+            "verified_human", False
+        ),
+        "credential": decision.get("credential"),
+    }
+
+
+# ============================================================
 # POST /ping — Starter Control
 # ============================================================
 
 @app.post("/ping")
 def ping():
-    """
-    Confirm the backend is responding correctly.
-
-    This route is intentionally kept unchanged.
-    """
-
     payload = request.get_json(silent=True) or {}
 
     return jsonify({
@@ -118,187 +201,104 @@ def ping():
 
 
 # ============================================================
-# GET /health — Service Status
+# GET /health
 # ============================================================
 
 @app.get("/health")
 def health():
-    """Return backend and detector information."""
-
-    loaded = detector._model is not None
-
     return jsonify({
         "ok": True,
         "detector_model": config.DETECTOR_MODEL,
-        "detector_loaded": loaded,
+        "detector_loaded": detector._model is not None,
         "rate_limiting": config.RATE_LIMITING_ENABLED,
-        "log_entries": len(audit.read_entries()),
+        "log_entries": len(all_audit_entries()),
     })
 
 
 # ============================================================
-# POST /submit — Milestone 4
+# POST /submit — Final Reader-Facing Labels
 # ============================================================
 
 @app.post("/submit")
 # @limiter.limit(f"{config.RATE_LIMIT_PER_MINUTE}/minute;{config.RATE_LIMIT_PER_DAY}/day")
 def submit():
     """
-    Receive writing, analyze it using three independent
-    signals, combine the results, and record the decision.
-
-    Milestone 4 Signals:
-        1. Language model (50%)
-        2. Stylometry (30%)
-        3. Repetition (20%) — Stretch Feature
+    Analyze text using the three detection signals.
 
     Expected JSON:
         {
             "text": "Writing to analyze...",
             "creator_id": "writer-001"
         }
-
-    The final reader-facing labels will be implemented
-    in Milestone 5.
     """
-
-    # --------------------------------------------------------
-    # Step 1: Read JSON request
-    # --------------------------------------------------------
 
     payload = request.get_json(silent=True)
 
     if not isinstance(payload, dict):
-        return jsonify({
-            "error": "invalid_json",
-            "message": "A valid JSON object is required.",
-        }), 400
+        return error_response(
+            "A valid JSON object is required."
+        )
 
     text = payload.get("text")
     creator_id = payload.get("creator_id")
 
-    # --------------------------------------------------------
-    # Step 2: Validate submitted text
-    # --------------------------------------------------------
-
+    # Validate the writing.
     if not isinstance(text, str):
-        return jsonify({
-            "error": "invalid_text",
-            "message": "text must be a string.",
-        }), 400
+        return error_response("text must be a string.")
 
     if not text.strip():
-        return jsonify({
-            "error": "empty_text",
-            "message": "text cannot be empty.",
-        }), 400
+        return error_response("text cannot be empty.")
 
     if len(text) > 20000:
-        return jsonify({
-            "error": "text_too_long",
-            "message": "Text must not exceed 20000 characters.",
-        }), 413
+        return error_response(
+            "Text must not exceed 20000 characters.", 413
+        )
 
     if len(text.split()) < 10:
-        return jsonify({
-            "error": "text_too_short",
-            "message": "Text must contain at least 10 words.",
-        }), 400
+        return error_response(
+            "Text must contain at least 10 words."
+        )
 
-    # --------------------------------------------------------
-    # Step 3: Validate creator ID
-    # --------------------------------------------------------
+    if not valid_string(creator_id, 100):
+        return error_response(
+            "creator_id must be a nonempty string "
+            "of at most 100 characters."
+        )
 
-    if (
-        not isinstance(creator_id, str)
-        or not creator_id.strip()
-    ):
-        return jsonify({
-            "error": "invalid_creator_id",
-            "message": "creator_id must be a nonempty string.",
-        }), 400
-
-    # --------------------------------------------------------
-    # Step 4: Signal 1 — Language Model
-    # --------------------------------------------------------
-
+    # Signal 1 — GPT-2 predictability.
     try:
         model_score = detector.model_signal(text)
 
     except detector.DetectorUnavailable as exc:
-        return jsonify({
-            "error": "detector_unavailable",
-            "message": str(exc),
-        }), 503
+        return error_response(str(exc), 503)
 
     except ValueError as exc:
-        return jsonify({
-            "error": "invalid_text",
-            "message": str(exc),
-        }), 400
+        return error_response(str(exc), 400)
 
-    # --------------------------------------------------------
-    # Step 5: Signal 2 — Stylometry
-    # --------------------------------------------------------
-
-    # Measures sentence-length variation,
-    # vocabulary diversity, and punctuation density.
-
+    # Signal 2 — Writing style.
     style_score = stylometry.style_signal(text)
 
-    # --------------------------------------------------------
-    # Step 6: Signal 3 — Repetition (Stretch Feature)
-    # --------------------------------------------------------
-
-    # Measures repeated neighboring word pairs.
-
+    # Signal 3 — Repeated word pairs (stretch).
     repetition_score = repetition_signal(text)
 
-    # --------------------------------------------------------
-    # Step 7: Combine All Three Signals
-    # --------------------------------------------------------
-
-    # Uses weights defined in config.py:
-    #   Model:      50%
-    #   Stylometry: 30%
-    #   Repetition: 20%
-    #
-    # Strong signal disagreement moves the score
-    # closer to 0.5 to communicate uncertainty.
-
+    # Milestone 4 combining rule, unchanged.
     confidence = scoring.combine_signals(
         model_score,
         style_score,
         repetition_score,
     )
 
-    # --------------------------------------------------------
-    # Step 8: Create Unique Submission ID
-    # --------------------------------------------------------
+    # Milestone 5: Replace placeholder labels.
+    guess, label = scoring.score_to_label(confidence)
+
+    # Verification is independent of authorship analysis.
+    verified = creator_is_verified(creator_id)
+    credential = "Verified Human" if verified else None
 
     content_id = str(uuid.uuid4())
-
-    # --------------------------------------------------------
-    # Step 9: Temporary Classification
-    # --------------------------------------------------------
-
-    # Milestone 4 calculates real confidence scores.
-    # Milestone 5 will convert them into reader-facing
-    # labels using scoring.score_to_label().
-
-    guess = "unsure"
-
-    label = (
-        "Analysis is incomplete. "
-        "Final classification labels are pending."
-    )
-
     status = "decided"
 
-    # --------------------------------------------------------
-    # Step 10: Record Decision in Audit Log
-    # --------------------------------------------------------
-
+    # Preserve the decision and all three signals.
     audit.log_decision(
         content_id=content_id,
         creator_id=creator_id,
@@ -309,11 +309,9 @@ def submit():
         label=label,
         status=status,
         repetition_score=repetition_score,
+        verified_human=verified,
+        credential=credential,
     )
-
-    # --------------------------------------------------------
-    # Step 11: Return JSON Response
-    # --------------------------------------------------------
 
     return jsonify({
         "content_id": content_id,
@@ -325,6 +323,8 @@ def submit():
         "style_score": style_score,
         "repetition_score": repetition_score,
         "status": status,
+        "verified_human": verified,
+        "credential": credential,
     }), 201
 
 
@@ -335,27 +335,219 @@ def submit():
 @app.post("/appeal")
 def appeal():
     """
-    Allow writers to appeal a classification.
-
-    This endpoint will be implemented in Milestone 5.
+    Append an appeal event to the audit log.
 
     Expected JSON:
         {
-            "content_id": "submission-id",
+            "content_id": "submission-uuid",
             "reasoning": "I wrote this myself."
         }
+
+    The local demo accepts appeals by content ID.
+    A real service must authenticate the writer.
     """
 
-    payload = request.get_json(silent=True) or {}
+    payload = request.get_json(silent=True)
+
+    if not isinstance(payload, dict):
+        return error_response(
+            "A valid JSON object is required."
+        )
+
+    content_id = payload.get("content_id")
+    reasoning = payload.get("reasoning")
+
+    if not valid_string(content_id, 100):
+        return error_response(
+            "A valid content_id is required."
+        )
+
+    if not valid_string(reasoning, 5000):
+        return error_response(
+            "reasoning must be nonempty and at most "
+            "5000 characters."
+        )
+
+    item = content_state(content_id)
+
+    if item is None:
+        return error_response("Content not found.", 404)
+
+    if item["status"] == "under_review":
+        return error_response(
+            "This content is already under review.", 409
+        )
+
+    # Append the appeal without changing the original record.
+    audit.log_appeal(
+        content_id=content_id,
+        creator_id=item["creator_id"],
+        reasoning=reasoning.strip(),
+    )
 
     return jsonify({
-        "error": "not_implemented",
+        "content_id": content_id,
+        "status": "under_review",
         "message": (
-            "POST /appeal is not implemented yet. "
-            "This endpoint will be completed in Milestone 5."
+            "Your appeal has been recorded for human review."
         ),
-        "you_sent": payload,
-    }), 501
+    }), 200
+
+
+# ============================================================
+# GET /content/<id> — Stretch Feature
+# ============================================================
+
+@app.get("/content/<content_id>")
+def get_content(content_id):
+    """
+    Return a submission and its current appeal status.
+    """
+
+    item = content_state(content_id)
+
+    if item is None:
+        return error_response("Content not found.", 404)
+
+    return jsonify(item), 200
+
+
+# ============================================================
+# POST /verify/start — Stretch Feature
+# ============================================================
+
+@app.post("/verify/start")
+def start_verification():
+    """
+    Create a five-minute arithmetic challenge.
+
+    This is an educational demonstration.
+    It is not proof of real-world human identity.
+    """
+
+    payload = request.get_json(silent=True)
+
+    if not isinstance(payload, dict):
+        return error_response(
+            "A valid JSON object is required."
+        )
+
+    creator_id = payload.get("creator_id")
+
+    if not valid_string(creator_id, 100):
+        return error_response(
+            "A valid creator_id is required."
+        )
+
+    if creator_is_verified(creator_id):
+        return jsonify({
+            "creator_id": creator_id,
+            "verified_human": True,
+            "credential": "Verified Human",
+            "message": "Creator already verified.",
+        }), 200
+
+    first_number = secrets.randbelow(30) + 10
+    second_number = secrets.randbelow(30) + 10
+    challenge_id = str(uuid.uuid4())
+
+    verification_challenges[challenge_id] = {
+        "creator_id": creator_id,
+        "answer": first_number + second_number,
+        "expires_at": time.time() + 300,
+        "attempts": 0,
+    }
+
+    return jsonify({
+        "challenge_id": challenge_id,
+        "creator_id": creator_id,
+        "question": (
+            f"What is {first_number} + {second_number}?"
+        ),
+        "expires_in_seconds": 300,
+    }), 201
+
+
+# ============================================================
+# POST /verify/complete — Stretch Feature
+# ============================================================
+
+@app.post("/verify/complete")
+def complete_verification():
+    """
+    Evaluate a challenge answer and log successful
+    demonstration verification.
+
+    A challenge permits up to three attempts.
+    """
+
+    payload = request.get_json(silent=True)
+
+    if not isinstance(payload, dict):
+        return error_response(
+            "A valid JSON object is required."
+        )
+
+    challenge_id = payload.get("challenge_id")
+    creator_id = payload.get("creator_id")
+    answer = payload.get("answer")
+
+    if not isinstance(challenge_id, str):
+        return error_response(
+            "challenge_id is required."
+        )
+
+    challenge = verification_challenges.get(challenge_id)
+
+    if challenge is None:
+        return error_response(
+            "Challenge not found or already used.", 404
+        )
+
+    if time.time() > challenge["expires_at"]:
+        del verification_challenges[challenge_id]
+        return error_response("Challenge expired.", 410)
+
+    if creator_id != challenge["creator_id"]:
+        return error_response(
+            "Creator does not match challenge.", 403
+        )
+
+    if type(answer) is not int:
+        return error_response("answer must be an integer.")
+
+    challenge["attempts"] += 1
+
+    if answer != challenge["answer"]:
+        if challenge["attempts"] >= 3:
+            del verification_challenges[challenge_id]
+            return error_response(
+                "Too many incorrect attempts.", 429
+            )
+
+        return error_response(
+            "Incorrect verification answer.", 400
+        )
+
+    del verification_challenges[challenge_id]
+
+    # Record the successful challenge as an audit event.
+    # This event is not a writing-classification decision.
+    audit.log_decision(
+        content_id=f"verification-{uuid.uuid4()}",
+        creator_id=creator_id,
+        event="human_verified",
+        status="verified",
+        credential="Verified Human",
+        verification_method="arithmetic_challenge",
+    )
+
+    return jsonify({
+        "creator_id": creator_id,
+        "verified_human": True,
+        "credential": "Verified Human",
+        "message": "Verification challenge completed.",
+    }), 200
 
 
 # ============================================================
@@ -364,16 +556,11 @@ def appeal():
 
 @app.get("/log")
 def get_log():
-    """
-    Return the most recent audit log entries.
-
-    Example:
-        GET /log?limit=10
-    """
-
     limit = request.args.get("limit", type=int)
+    entries = all_audit_entries()
 
-    entries = audit.read_entries(limit=limit)
+    if limit is not None:
+        entries = entries[-max(limit, 0):] if limit > 0 else []
 
     return jsonify({
         "count": len(entries),
@@ -386,9 +573,10 @@ def get_log():
 # ============================================================
 
 def main():
-    """Launch the Provenance Guard backend."""
-
-    print(f"Provenance Guard on http://{config.HOST}:{config.PORT}")
+    print(
+        f"Provenance Guard on "
+        f"http://{config.HOST}:{config.PORT}"
+    )
     print(f"  detector model:  {config.DETECTOR_MODEL}")
     print(
         "  rate limiting:   "
@@ -397,13 +585,6 @@ def main():
     print(f"  audit log:       {config.AUDIT_LOG}")
     print()
 
-    print("Check it's alive:")
-    print(f'  curl -X POST http://{config.HOST}:{config.PORT}/ping \\')
-    print('    -H "Content-Type: application/json" \\')
-    print("    -d '{\"message\": \"hello\"}'")
-    print()
-
-    # Debug mode is for local development only.
     app.run(
         host=config.HOST,
         port=config.PORT,

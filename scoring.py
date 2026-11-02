@@ -104,34 +104,57 @@ def combine_signals(
     return round(clamp(combined), 4)
 
 
-# ── Labels — Milestone 5 ─────────────────────────────────────
+# ── Reader-Facing Labels — Milestone 5 ───────────────────────
 
 def score_to_label(score: float) -> tuple[str, str]:
     """
     Convert a score into a guess and reader-facing label.
 
-    Milestone 5 will replace the placeholder text
-    with three complete reader-friendly labels.
+    Label ranges:
+        0.00–0.30: Human
+        >0.30–<0.80: Unsure
+        0.80–1.00: AI
+
+    The labels explain patterns without claiming
+    to prove authorship.
 
     Returns:
         (guess, label_text)
     """
 
+    # Validate the score.
+    score = float(score)
+
+    if not math.isfinite(score):
+        raise ValueError("Score must be a finite number.")
+
+    if not 0.0 <= score <= 1.0:
+        raise ValueError("Score must be between 0 and 1.")
+
+    # High-confidence AI
     if score >= config.AI_THRESHOLD:
         return (
             "ai",
-            "PLACEHOLDER — write the high-confidence AI label.",
+            "This writing shows patterns associated with "
+            "AI-generated text. This is not proof of AI "
+            "authorship, and the writer may appeal.",
         )
 
+    # High-confidence human
     if score <= config.HUMAN_THRESHOLD:
         return (
             "human",
-            "PLACEHOLDER — write the high-confidence human label.",
+            "This writing shows patterns associated with "
+            "human writing. Automated analysis cannot "
+            "verify who wrote it.",
         )
 
+    # Unsure
     return (
         "unsure",
-        "PLACEHOLDER — write the unsure label.",
+        "We cannot reliably determine how this text was "
+        "written. No conclusion about its authorship "
+        "should be drawn from this result.",
     )
 
 
@@ -165,7 +188,7 @@ def label_ranges() -> list[tuple[str, str]]:
 # ── Terminal Testing ────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("Provenance Guard — Milestone 4 Scoring")
+    print("Provenance Guard — Milestone 5 Scoring")
     print()
 
     examples = [
@@ -174,6 +197,8 @@ if __name__ == "__main__":
         (0.90, 0.90, 0.90),
         (0.90, 0.20, 0.10),
     ]
+
+    print("Combined signal tests:")
 
     for model, style, repetition in examples:
         result = combine_signals(
@@ -191,5 +216,16 @@ if __name__ == "__main__":
 
     print()
     print("Label ranges:")
+
     for name, score_range in label_ranges():
         print(f"{name}: {score_range}")
+
+    print()
+    print("Reader-facing label examples:")
+
+    for score in [0.10, 0.30, 0.50, 0.80, 0.95]:
+        guess, label = score_to_label(score)
+
+        print(f"\nScore: {score:.2f}")
+        print(f"Guess: {guess}")
+        print(f"Label: {label}")
