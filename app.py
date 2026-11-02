@@ -4,11 +4,11 @@
 Provenance Guard — Flask Backend
 
 AI 201 — Project 4
-Milestone 3: Submission Endpoint
+Milestone 4: Multiple Signals and Confidence Scoring
 
 Routes:
     POST /ping       Working example
-    POST /submit     Submit text for analysis
+    POST /submit     Submit text for three-signal analysis
     POST /appeal     Milestone 5
     GET  /log        Read audit log
     GET  /health     Service health information
@@ -21,6 +21,10 @@ from flask import Flask, jsonify, request
 import audit
 import config
 import detector
+import scoring
+import stylometry
+
+from repetition import repetition_signal
 
 
 app = Flask(__name__)
@@ -133,26 +137,29 @@ def health():
 
 
 # ============================================================
-# POST /submit — Milestone 3
+# POST /submit — Milestone 4
 # ============================================================
 
 @app.post("/submit")
 # @limiter.limit(f"{config.RATE_LIMIT_PER_MINUTE}/minute;{config.RATE_LIMIT_PER_DAY}/day")
 def submit():
     """
-    Receive writing, analyze it, and record the decision.
+    Receive writing, analyze it using three independent
+    signals, combine the results, and record the decision.
 
-    Milestone 3 uses only the first signal:
-        detector.model_signal(text)
-
-    Milestone 4 will introduce stylometry and combined scoring.
-    Milestone 5 will introduce the final reader-facing labels.
+    Milestone 4 Signals:
+        1. Language model (50%)
+        2. Stylometry (30%)
+        3. Repetition (20%) — Stretch Feature
 
     Expected JSON:
         {
             "text": "Writing to analyze...",
             "creator_id": "writer-001"
         }
+
+    The final reader-facing labels will be implemented
+    in Milestone 5.
     """
 
     # --------------------------------------------------------
@@ -171,7 +178,7 @@ def submit():
     creator_id = payload.get("creator_id")
 
     # --------------------------------------------------------
-    # Step 2: Validate the submitted text
+    # Step 2: Validate submitted text
     # --------------------------------------------------------
 
     if not isinstance(text, str):
@@ -212,7 +219,7 @@ def submit():
         }), 400
 
     # --------------------------------------------------------
-    # Step 4: Run the first detection signal
+    # Step 4: Signal 1 — Language Model
     # --------------------------------------------------------
 
     try:
@@ -231,27 +238,65 @@ def submit():
         }), 400
 
     # --------------------------------------------------------
-    # Step 5: Create unique submission ID
+    # Step 5: Signal 2 — Stylometry
+    # --------------------------------------------------------
+
+    # Measures sentence-length variation,
+    # vocabulary diversity, and punctuation density.
+
+    style_score = stylometry.style_signal(text)
+
+    # --------------------------------------------------------
+    # Step 6: Signal 3 — Repetition (Stretch Feature)
+    # --------------------------------------------------------
+
+    # Measures repeated neighboring word pairs.
+
+    repetition_score = repetition_signal(text)
+
+    # --------------------------------------------------------
+    # Step 7: Combine All Three Signals
+    # --------------------------------------------------------
+
+    # Uses weights defined in config.py:
+    #   Model:      50%
+    #   Stylometry: 30%
+    #   Repetition: 20%
+    #
+    # Strong signal disagreement moves the score
+    # closer to 0.5 to communicate uncertainty.
+
+    confidence = scoring.combine_signals(
+        model_score,
+        style_score,
+        repetition_score,
+    )
+
+    # --------------------------------------------------------
+    # Step 8: Create Unique Submission ID
     # --------------------------------------------------------
 
     content_id = str(uuid.uuid4())
 
     # --------------------------------------------------------
-    # Step 6: Temporary classification
+    # Step 9: Temporary Classification
     # --------------------------------------------------------
 
-    # These values will be replaced in Milestones 4 and 5.
+    # Milestone 4 calculates real confidence scores.
+    # Milestone 5 will convert them into reader-facing
+    # labels using scoring.score_to_label().
+
     guess = "unsure"
-    confidence = 0.5
+
     label = (
         "Analysis is incomplete. "
-        "Additional detection signals are pending."
+        "Final classification labels are pending."
     )
 
     status = "decided"
 
     # --------------------------------------------------------
-    # Step 7: Record decision in audit log
+    # Step 10: Record Decision in Audit Log
     # --------------------------------------------------------
 
     audit.log_decision(
@@ -259,14 +304,15 @@ def submit():
         creator_id=creator_id,
         guess=guess,
         model_score=model_score,
-        style_score=None,
+        style_score=style_score,
         combined_score=confidence,
         label=label,
         status=status,
+        repetition_score=repetition_score,
     )
 
     # --------------------------------------------------------
-    # Step 8: Return JSON response
+    # Step 11: Return JSON Response
     # --------------------------------------------------------
 
     return jsonify({
@@ -276,7 +322,8 @@ def submit():
         "confidence": confidence,
         "label": label,
         "model_score": model_score,
-        "style_score": None,
+        "style_score": style_score,
+        "repetition_score": repetition_score,
         "status": status,
     }), 201
 

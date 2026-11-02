@@ -1,105 +1,195 @@
+
 """
-Turning two numbers into one, and one number into something a person can read.
-← YOU BUILD THIS IN MILESTONES 4 AND 5
+Provenance Guard — Scoring System
 
-Two functions live here, and both are stubs.
+Milestone 4:
+    Combine three detection signals into one AI-likeness score.
 
-`combine_signals` is where your false-positive decision from Milestone 1
-actually gets made. Everything above it — the labels, the appeal path — is
-downstream of a number this function produced.
+Milestone 5:
+    Convert the score into a reader-facing classification.
 
-`score_to_label` is where you stop writing for a machine and start writing for
-a person. A score of 0.62 means nothing to a writer.
+The combining rule is located in:
+    scoring.py::combine_signals
 
-⚠️ Your README's **Signals and Scoring** section has to name the file and
-function holding your combining rule. The grader checks your code against what
-you claim, so that line should read `scoring.py::combine_signals`.
+Signals:
+    1. Language model (50%)
+    2. Stylometry (30%)
+    3. Repetition (20%) — Stretch Feature
+
+Higher scores indicate more AI-like writing patterns.
+
+These scores are heuristics and do not prove authorship.
 """
 
+import math
 import config
 
 
-def combine_signals(model_score: float, style_score: float) -> float:
+# ── Helper ───────────────────────────────────────────────────
+
+def clamp(value: float) -> float:
+    """Keep a number between 0.0 and 1.0."""
+    return max(0.0, min(1.0, float(value)))
+
+
+# ── Combining the signals — Milestone 4 ─────────────────────
+
+def combine_signals(
+    model_score: float,
+    style_score: float,
+    repetition_score: float = 0.5,
+) -> float:
     """
-    Combine two 0–1 signals into one 0–1 score. ← TODO (Milestone 4)
+    Combine three signals into one score between 0 and 1.
 
-    Both inputs point the same way: higher means more likely AI. Your output
-    should too.
+    Higher scores indicate more AI-like writing patterns.
 
-    Args:
-        model_score: from `detector.model_signal` — how predictable the text is.
-        style_score: from `stylometry.style_signal` — the shape of the text.
+    Signal weights:
+        Model:      50%
+        Stylometry: 30%
+        Repetition: 20%
 
-    Returns:
-        A float from 0.0 (confidently human) to 1.0 (confidently AI).
+    Formula:
+        combined = (
+            0.50 * model_score
+            + 0.30 * style_score
+            + 0.20 * repetition_score
+        )
 
-    ⚠️ **Write the rule down before you code it, and put the numbers in your
-    README.** A weighted average is the obvious choice and it is not the only
-    one. Things worth thinking about:
+    Disagreement handling:
+        If the difference between the highest and lowest
+        signal is at least 0.45, move the combined score
+        halfway toward 0.50.
 
-      - **What happens when they disagree?** One signal at 0.9 and the other at
-        0.1 averages to 0.5 — "unsure". Is that what you want? It might be
-        exactly right: two methods disagreeing IS uncertainty. Or you might
-        decide one signal is more trustworthy when they split.
+    Example:
+        Model = 0.90
+        Style = 0.20
+        Repetition = 0.10
 
-      - **Which way do you want to be wrong?** Weighting toward the signal that
-        reads more human means fewer false accusations and more AI text
-        getting through. There's no weighting that avoids the trade.
+        Weighted score = 0.53
+        Adjusted score = 0.515
 
-      - Milestone 4 asks you to find a case where your two signals split and
-        write it down. That case is what this rule exists to handle.
-
-    The weights in config.py are placeholders. Change them, or ignore them and
-    write a different rule.
+    The default repetition_score=0.5 preserves compatibility
+    with existing code that passes only two signals.
     """
-    # TODO: replace this
-    return (
-        config.WEIGHT_MODEL_SIGNAL * model_score
-        + config.WEIGHT_STYLE_SIGNAL * style_score
+
+    values = [
+        float(model_score),
+        float(style_score),
+        float(repetition_score),
+    ]
+
+    # Reject invalid numerical values.
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Signal scores must be finite numbers.")
+
+    model, style, repetition = map(clamp, values)
+
+    # Weighted combination.
+    combined = (
+        config.WEIGHT_MODEL_SIGNAL * model
+        + config.WEIGHT_STYLE_SIGNAL * style
+        + config.WEIGHT_REPETITION_SIGNAL * repetition
     )
 
+    # Detect strong disagreement.
+    disagreement = max(values) - min(values)
+
+    if disagreement >= config.DISAGREEMENT_THRESHOLD:
+        combined = (
+            0.5
+            + (combined - 0.5) * config.DISAGREEMENT_SHRINK
+        )
+
+    return round(clamp(combined), 4)
+
+
+# ── Labels — Milestone 5 ─────────────────────────────────────
 
 def score_to_label(score: float) -> tuple[str, str]:
     """
-    Turn a score into a guess and the text a reader actually sees.
-    ← TODO (Milestone 5)
+    Convert a score into a guess and reader-facing label.
+
+    Milestone 5 will replace the placeholder text
+    with three complete reader-friendly labels.
 
     Returns:
-        (guess, label_text) — where `guess` is a short machine-readable string
-        like "ai" / "human" / "unsure", and `label_text` is the full sentence
-        shown to a person.
-
-    ⚠️ Write the label text for someone who has never heard the word
-    "threshold".
-
-        ✗ "human, 0.81 confidence"
-        ✓ "We think this was probably written by a person."
-
-    All three labels have to be **reachable**. If no score can produce one of
-    them, your ranges have a gap — and Milestone 5 asks you to submit text that
-    produces each one, which is how you'd find out.
-
-    The hardest one to write is "unsure". It has to admit uncertainty without
-    sounding like an accusation, because the person reading it may well have
-    written every word themselves. Your breakout asks your group what they'd
-    think if they got it on their own work. That question is the whole
-    milestone.
+        (guess, label_text)
     """
-    # TODO: replace this — thresholds are in config.py
-    if score >= config.AI_THRESHOLD:
-        return "ai", "PLACEHOLDER — write the high-confidence AI label."
-    if score <= config.HUMAN_THRESHOLD:
-        return "human", "PLACEHOLDER — write the high-confidence human label."
-    return "unsure", "PLACEHOLDER — write the unsure label."
 
+    if score >= config.AI_THRESHOLD:
+        return (
+            "ai",
+            "PLACEHOLDER — write the high-confidence AI label.",
+        )
+
+    if score <= config.HUMAN_THRESHOLD:
+        return (
+            "human",
+            "PLACEHOLDER — write the high-confidence human label.",
+        )
+
+    return (
+        "unsure",
+        "PLACEHOLDER — write the unsure label.",
+    )
+
+
+# ── Label Ranges ─────────────────────────────────────────────
 
 def label_ranges() -> list[tuple[str, str]]:
     """
-    The score range each label covers. Your README needs these beside the
-    label text — given to you so the numbers can't drift apart from config.py.
+    Return the score range for each label.
+
+    Uses thresholds from config.py to prevent
+    documentation and implementation from drifting apart.
     """
+
     return [
-        ("high-confidence human", f"0.00 – {config.HUMAN_THRESHOLD:.2f}"),
-        ("unsure", f"{config.HUMAN_THRESHOLD:.2f} – {config.AI_THRESHOLD:.2f}"),
-        ("high-confidence AI", f"{config.AI_THRESHOLD:.2f} – 1.00"),
+        (
+            "high-confidence human",
+            f"0.00 through {config.HUMAN_THRESHOLD:.2f} (inclusive)",
+        ),
+        (
+            "unsure",
+            f"above {config.HUMAN_THRESHOLD:.2f} "
+            f"and below {config.AI_THRESHOLD:.2f}",
+        ),
+        (
+            "high-confidence AI",
+            f"{config.AI_THRESHOLD:.2f} through 1.00 (inclusive)",
+        ),
     ]
+
+
+# ── Terminal Testing ────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("Provenance Guard — Milestone 4 Scoring")
+    print()
+
+    examples = [
+        (0.10, 0.20, 0.10),
+        (0.50, 0.50, 0.50),
+        (0.90, 0.90, 0.90),
+        (0.90, 0.20, 0.10),
+    ]
+
+    for model, style, repetition in examples:
+        result = combine_signals(
+            model,
+            style,
+            repetition,
+        )
+
+        print(
+            f"Model={model:.2f}, "
+            f"Style={style:.2f}, "
+            f"Repetition={repetition:.2f} "
+            f"-> Combined={result:.4f}"
+        )
+
+    print()
+    print("Label ranges:")
+    for name, score_range in label_ranges():
+        print(f"{name}: {score_range}")

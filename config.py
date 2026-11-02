@@ -1,110 +1,165 @@
+
 """
 Settings for Provenance Guard.
 
 Everything you're likely to change lives here, at the top, on purpose.
 
-You'll edit the thresholds in Milestone 5 and the rate limits in unit 8.
+Milestone 4:
+    - Three weighted detection signals
+    - Disagreement handling
+
+Milestone 5:
+    - Classification thresholds and final labels
+
+Unit 8:
+    - Rate limiting and adversarial evaluation
 """
 
 import os
 from pathlib import Path
+
 
 ROOT = Path(__file__).parent
 
 
 # ─── The service ─────────────────────────────────────────────────────────────
 
-# `127.0.0.1` is loopback — only your own machine can reach it, which is what
-# you want all through units 7 and 8. A host somewhere else has to accept
-# traffic from outside the box, and that means `0.0.0.0`. Setting the env var
-# is how you get it; the default keeps your local `curl` commands unchanged.
+# 127.0.0.1 is loopback, so only your own computer can access the service.
+# The HOST environment variable can override this for deployment.
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "5000"))
 
-# Flask's debug mode gives anyone who can reach the service an interactive
-# Python prompt inside your process. Fine on loopback, a gift to strangers
-# anywhere else — so it turns itself off the moment HOST isn't loopback.
-DEBUG = os.getenv("AI201_DEBUG", "1") == "1" and HOST in ("127.0.0.1", "localhost")
+# Debug mode should only be available on the local machine.
+# Never expose the Flask interactive debugger publicly.
+DEBUG = (
+    os.getenv("AI201_DEBUG", "1") == "1"
+    and HOST in ("127.0.0.1", "localhost")
+)
 
 
 # ─── The local model ─────────────────────────────────────────────────────────
-# Your first signal runs a language model ON YOUR OWN MACHINE. No account, no
-# key, no card. It downloads about 550 MB the first time — do that before
-# class, not during it.
+
+# The first signal runs a local GPT-2 language model.
+# No API key or hosted service is required.
 #
-# What it measures: how *predictable* your text is to a language model. Text a
-# model finds easy to predict tends to be text a model wrote.
-#
-# The first call is the slow one — ten to twenty seconds while the model loads,
-# longer on an older laptop. After that it stays in memory and a submission
-# takes a second or two. That cost is part of what you're learning: this is
-# what running a model inline in a request actually looks like.
+# The model measures the predictability of text.
+# Predictable writing may receive a higher AI-likeness score,
+# but this does not prove AI authorship.
 
 DETECTOR_MODEL = os.getenv("AI201_DETECTOR_MODEL", "gpt2")
 
-# Longer text gives a steadier reading but takes longer. 400 tokens is roughly
-# 300 words, which is enough for the signal to mean something.
+# Limit the number of tokens processed by the detector.
+# Longer passages provide more context but require more processing.
 DETECTOR_MAX_TOKENS = 400
 
 
 # ─── Scoring (Milestone 4) ───────────────────────────────────────────────────
-# How much each signal counts toward the combined score.
-#
-# ⚠️ These are placeholders. Milestone 4 asks you to write your combining rule
-# down BEFORE you code it, and to put the numbers in your README. Whatever you
-# decide, it goes here.
 
-WEIGHT_MODEL_SIGNAL = 0.5
-WEIGHT_STYLE_SIGNAL = 0.5
+# Provenance Guard combines three independent signals.
+#
+# Signal 1: Language model
+#   Analyzes text predictability using GPT-2.
+#
+# Signal 2: Stylometry
+#   Analyzes sentence-length variation, vocabulary diversity,
+#   and punctuation density.
+#
+# Signal 3: Repetition (stretch feature)
+#   Analyzes repeated neighboring word pairs.
+#
+# Higher scores indicate more AI-like writing patterns.
+# All scores are expected to fall between 0.0 and 1.0.
+#
+# The weights were selected to prioritize the local model
+# while incorporating additional writing characteristics.
+#
+# Combined score:
+#
+#   (0.50 * model_score)
+# + (0.30 * style_score)
+# + (0.20 * repetition_score)
+
+WEIGHT_MODEL_SIGNAL = 0.50
+WEIGHT_STYLE_SIGNAL = 0.30
+WEIGHT_REPETITION_SIGNAL = 0.20
+
+
+# ─── Disagreement handling (Milestone 4) ─────────────────────────────────────
+
+# When the signals disagree substantially, the system should
+# communicate uncertainty instead of making a strong accusation.
+#
+# Example:
+#   model_score      = 0.90
+#   style_score      = 0.20
+#   repetition_score = 0.10
+#
+#   Weighted score = 0.53
+#
+# Since the largest and smallest signal differ by 0.80,
+# the disagreement safeguard applies:
+#
+#   adjusted_score = 0.50 + (0.53 - 0.50) * 0.50
+#                  = 0.515
+#
+# This moves the final result closer to uncertainty.
+
+DISAGREEMENT_THRESHOLD = 0.45
+DISAGREEMENT_SHRINK = 0.50
 
 
 # ─── Thresholds (Milestone 5) ────────────────────────────────────────────────
-# Where one label becomes another. Scores run 0.0 (confidently human) to 1.0
-# (confidently AI).
-#
-#   score < HUMAN_THRESHOLD          -> high-confidence human
-#   between the two                  -> unsure
-#   score > AI_THRESHOLD             -> high-confidence AI
-#
-# ⚠️ This is where your false-positive decision from Milestone 1 actually gets
-# made. Widening the unsure band means fewer wrong accusations and more AI text
-# getting through. There is no setting that avoids the trade — only settings
-# that decide who pays for it.
 
-HUMAN_THRESHOLD = 0.35
-AI_THRESHOLD = 0.65
-
-# ⚠️ One thing that catches people out in Milestone 5. A weighted average can
-# only land between its two inputs — so while `style_signal` is still the stub
-# returning 0.5, the combined score can never leave 0.25–0.75 no matter what
-# the model signal says, and the human label needs a model score below 0.20 to
-# be reachable at all.
+# The final score will determine one of three classifications.
 #
-# If a label you can't reach is the problem, the fix is upstream of the
-# thresholds: a style signal that actually varies. `scoring.label_ranges()`
-# prints the bands; the reachable range is a different question.
+# Scores:
+#
+#   0.00 <= score <= 0.30  -> High-confidence human
+#   0.30 < score < 0.80    -> Unsure
+#   0.80 <= score <= 1.00  -> High-confidence AI
+#
+# These thresholds are deliberately conservative.
+#
+# A false positive occurs when human writing is classified
+# as AI-generated. Such an accusation can damage a writer's
+# credibility, so uncertainty is preferable when signals
+# do not strongly agree.
+
+HUMAN_THRESHOLD = 0.30
+AI_THRESHOLD = 0.80
 
 
 # ─── Rate limiting (UNIT 8) ──────────────────────────────────────────────────
-# Off in unit 7. You turn it on and choose the numbers in unit 8, Milestone 1.
+
+# Rate limiting remains disabled during Unit 7.
 #
-# Think about two people: a real writer submitting their own work a few times
-# an hour, and a script sending a thousand variations to map your thresholds.
-# Your README has to say why your numbers and not others.
+# In Unit 8, we will enable it to reduce repeated automated
+# requests intended to probe or manipulate classification scores.
+#
+# Enable with:
+#   AI201_RATE_LIMITS=1 python app.py
 
 RATE_LIMITING_ENABLED = os.getenv("AI201_RATE_LIMITS", "0") == "1"
 
+# Maximum number of requests permitted per minute and per day.
+# These settings are reserved for Unit 8.
 RATE_LIMIT_PER_MINUTE = 10
 RATE_LIMIT_PER_DAY = 200
 
-# Flask-Limiter warns loudly without this. In-memory is right for one laptop
-# and wrong for anything real — a restart forgets every count, and two copies
-# of the service wouldn't share limits.
+# In-memory storage is suitable for this local coursework project.
+# It is not appropriate for a distributed production service because
+# counters are lost when the application restarts.
 RATE_LIMIT_STORAGE = "memory://"
 
 
 # ─── Paths ───────────────────────────────────────────────────────────────────
 
+# Directory containing the project.
+ROOT = Path(__file__).parent
+
+# Structured audit records are stored here.
 LOG_DIR = ROOT / "logs"
 AUDIT_LOG = LOG_DIR / "audit.jsonl"
+
+# Evaluation output will be stored here during Unit 8.
 RESULTS_DIR = ROOT / "results"
