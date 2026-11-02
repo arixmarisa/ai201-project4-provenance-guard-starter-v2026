@@ -169,6 +169,48 @@ $ curl "http://127.0.0.1:5000/log?limit=3"
 - *What came back:*
 - *What I changed:*
 
+## Planned Stretch Features — Unit 7
+
+I plan to implement all three optional stretch features
+for Provenance Guard.
+
+### 1. Third Detection Signal (+1 Point)
+
+I will add a third signal that analyzes repeated word
+patterns in submitted writing.
+
+The three signals will use these weights:
+- Language model: 50%
+- Stylometry: 30%
+- Repetition analysis: 20%
+
+This additional signal will help identify repetitive
+writing patterns that the other signals may miss.
+
+### 2. Content Lookup Endpoint (+1 Point)
+
+I will implement `GET /content/<id>` to retrieve the
+current classification and review status of a submission.
+
+The endpoint will return the content ID, classification,
+confidence score, label, and current status.
+
+This will make it possible to check whether a submission
+is still decided or has moved to under_review.
+
+### 3. Verified-Human Credential (+1 Point)
+
+I will add a verification process where writers must
+complete an additional challenge before receiving a
+Verified Human credential.
+
+Once the challenge is completed, the credential will
+appear on the writer's future submissions.
+
+The credential will indicate that the writer completed
+the challenge, not that the submitted text was proven
+human-written.
+
 <!-- ═══════════════════════ UNIT 8 — THE TEST ═══════════════════════ -->
 
 ---
